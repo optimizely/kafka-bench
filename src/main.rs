@@ -3,7 +3,7 @@ use std::{sync::{atomic::{AtomicI32, Ordering}}, time::{Instant, Duration}};
 use anyhow::Error;
 use clap::Parser;
 use hdrhistogram::Histogram;
-use rdkafka::{ClientConfig, consumer::{StreamConsumer, Consumer}, producer::{FutureProducer, FutureRecord}, Message};
+use rdkafka::{ClientConfig, consumer::{CommitMode, StreamConsumer, Consumer}, producer::{FutureProducer, FutureRecord}, Message, config::RDKafkaLogLevel};
 use tokio::{sync::{Mutex}, task::yield_now};
 use futures::{TryStreamExt};
 
@@ -62,10 +62,14 @@ impl Args {
             .set("bootstrap.servers", &self.server)
             .set("enable.partition.eof", "false")
             .set("session.timeout.ms", "6000")
-            .set("enable.auto.commit", "true")
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "latest")
+            .set("debug", "all")
+            .set("security.protocol", "SASL_SSL")
             .set("sasl.mechanisms", "SCRAM-SHA-256")
             .set("sasl.username", self.username.as_ref().unwrap())
             .set("sasl.password", self.password.as_ref().unwrap())
+            .set_log_level(RDKafkaLogLevel::Debug)
             .create()
             .expect("Consumer creation failed");
 
@@ -77,9 +81,12 @@ impl Args {
         let producer: FutureProducer = ClientConfig::new()
             .set("bootstrap.servers", &self.server)
             .set("message.timeout.ms", "5000")
+            .set("debug", "all")
+            .set("security.protocol", "SASL_SSL")
             .set("sasl.mechanisms", "SCRAM-SHA-256")
             .set("sasl.username", self.username.as_ref().unwrap())
             .set("sasl.password", self.password.as_ref().unwrap())
+            .set_log_level(RDKafkaLogLevel::Debug)
             .create()
             .expect("Producer creation error");
 
@@ -101,11 +108,11 @@ impl Args {
         tokio_scoped::scope(|s| {
             // result collector
             s.spawn(async {
-                let hist : Mutex<Histogram<u64>> = Mutex::new(hdrhistogram::Histogram::new(2).unwrap());
+                let hist : Mutex<Histogram<u64>> = Mutex::new(hdrhistogram::Histogram::new(3).unwrap());
 
                 eprintln!("runtime_uS,concurrency");
                 let last_print = Mutex::new(Instant::now());
-                consumer.stream().try_for_each(|message| {
+                let result = consumer.stream().try_for_each(|message| {
                     let message = message.detach();
                     let concurrency = &concurrency;
                     let hist = &hist;
@@ -130,10 +137,15 @@ impl Args {
                         }
                         std::result::Result::Ok(())
                     }
-                }).await.unwrap();
-                    
-                let hist = hist.into_inner();
-                quantiles(&hist, 2, 3).unwrap();
+                }).await;
+
+                //consumer.commit_consumer_state(CommitMode::Sync).unwrap();
+                if let std::result::Result::Err(rdkafka::error::KafkaError::Canceled) = result {
+                    let hist = hist.into_inner();
+                    quantiles(&hist, 2, 3).unwrap();
+                } else {
+                    result.unwrap();
+                }
             });
 
             // workers
@@ -153,6 +165,7 @@ impl Args {
 
                             let record : FutureRecord<String, Vec<u8>> = FutureRecord::to(&self.topic).payload(&blob);
                             producer.send(record, Duration::from_secs(10)).await.unwrap();
+                            concurrency.fetch_add(-1, Ordering::Relaxed);
                         }
                     });
                 }
@@ -195,6 +208,7 @@ impl Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    env_logger::init();
     let args : Args = Args::parse();
     args.bench().await?;
     
